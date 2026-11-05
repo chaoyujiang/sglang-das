@@ -1020,6 +1020,7 @@ class C4IndexerBackendMixin:
         )
         persistent_mqa_selected = False
         mqa_chunk_plan = None
+        sparse_mask = None
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -1159,24 +1160,110 @@ class C4IndexerBackendMixin:
                 use_lightop = _is_hcu and not (
                     use_fp4_indexer or _use_tilelang or _use_aiter
                 )
-                logits = fn(
-                    q,
-                    c4_indexer_kv_cache,
-                    weights,
-                    (
-                        _c4sl.reshape(-1).to(torch.int32).contiguous()
-                        if use_lightop
-                        else _c4sl
-                    ),
-                    (
-                        indexer_page_table.to(torch.int32).contiguous()
-                        if use_lightop
-                        else indexer_page_table
-                    ),
-                    None if use_lightop else indexer_metadata.deep_gemm_metadata,
-                    indexer_metadata.max_c4_seq_len,
-                    False,
+                use_deepgemm_sparse_mask_topk = (
+                    envs.SGLANG_DSV4_HCU_DEEPGEMM_MASK_TOPK.get()
+                    and use_lightop
+                    and q.dtype == torch.float8_e4m3fn
+                    and q.dim() == 4
+                    and q.shape[1] == 1
+                    and q.shape[2] == 64
+                    and q.shape[3] == 128
+                    and q.is_contiguous()
+                    and c4_indexer_kv_cache.dtype == torch.uint8
+                    and weights.dtype == torch.float32
+                    and weights.is_contiguous()
                 )
+                use_lightop_sparse_mask_topk = (
+                    envs.SGLANG_DSV4_HCU_LIGHTOP_MASK_TOPK.get()
+                    and not use_deepgemm_sparse_mask_topk
+                    and use_lightop
+                    and q.dtype == torch.float8_e4m3fn
+                    and q.dim() == 4
+                    and q.shape[1] == 1
+                    and q.shape[2] == 64
+                    and q.shape[3] == 128
+                    and q.is_contiguous()
+                    and c4_indexer_kv_cache.dtype == torch.uint8
+                    and weights.dtype == torch.float32
+                    and weights.is_contiguous()
+                )
+                use_sparse_mask_topk = (
+                    use_deepgemm_sparse_mask_topk
+                    or use_lightop_sparse_mask_topk
+                )
+                if use_sparse_mask_topk:
+                    seq_lens_i32 = (
+                        _c4sl.reshape(-1).to(torch.int32).contiguous()
+                    )
+                    block_table_i32 = (
+                        indexer_page_table.to(torch.int32).contiguous()
+                    )
+                    if use_deepgemm_sparse_mask_topk:
+                        import deepgemm
+
+                        logits, sparse_mask = (
+                            deepgemm.page_mqa_logits_sparse_mask(
+                                q,
+                                c4_indexer_kv_cache,
+                                weights,
+                                seq_lens_i32,
+                                block_table_i32,
+                                indexer_metadata.max_c4_seq_len,
+                            )
+                        )
+                        if not hasattr(
+                            self, "_dsv4_deepgemm_sparse_mask_logged"
+                        ):
+                            logger.info(
+                                "DSV4 indexer producer=DeepGEMM sparse-mask "
+                                "MQA, consumer=LightOp mask Top512"
+                            )
+                            self._dsv4_deepgemm_sparse_mask_logged = True
+                    else:
+                        logits, sparse_mask = (
+                            gemmopt.page_mqa_logits_sparse_mask(
+                                q,
+                                c4_indexer_kv_cache,
+                                weights,
+                                seq_lens_i32,
+                                block_table_i32,
+                                None,
+                                indexer_metadata.max_c4_seq_len,
+                                True,
+                            )
+                        )
+                else:
+                    if (
+                        (
+                            envs.SGLANG_DSV4_HCU_DEEPGEMM_MASK_TOPK.get()
+                            or envs.SGLANG_DSV4_HCU_LIGHTOP_MASK_TOPK.get()
+                        )
+                        and use_lightop
+                        and not hasattr(self, "_dsv4_sparse_mask_fallback_logged")
+                    ):
+                        logger.warning(
+                            "DSV4 sparse-mask Top512 requested but the "
+                            "FP8 gfx938 64-head contract is not met; using dense logits"
+                        )
+                        self._dsv4_sparse_mask_fallback_logged = True
+                    logits = fn(
+                        q,
+                        c4_indexer_kv_cache,
+                        weights,
+                        (
+                            _c4sl.reshape(-1).to(torch.int32).contiguous()
+                            if use_lightop
+                            else _c4sl
+                        ),
+                        (
+                            indexer_page_table.to(torch.int32).contiguous()
+                            if use_lightop
+                            else indexer_page_table
+                        ),
+                        None if use_lightop else indexer_metadata.deep_gemm_metadata,
+                        indexer_metadata.max_c4_seq_len,
+                        False,
+                    )
 
             if use_int8_index_k_cache and not persistent_mqa_selected and not hasattr(
                 self, "_dsv4_int8_indexer_path_logged"
@@ -1286,7 +1373,19 @@ class C4IndexerBackendMixin:
                     f"got raw_indices.shape={raw_indices.shape}, logits.shape={logits.shape}"
                 )
 
-            if (
+            if sparse_mask is not None:
+                from lightop import topk_transform_512_sparse_mask
+
+                topk_transform_512_sparse_mask(
+                    logits,
+                    sparse_mask,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            elif (
                 envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
                 or self.dsa_topk_backend.is_torch()
             ):

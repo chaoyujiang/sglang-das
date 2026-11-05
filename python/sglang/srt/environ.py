@@ -1606,6 +1606,10 @@ class Envs:
     SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_LIGHTOP_MASK_TOPK"
     )
+    # gfx938 DSV4 FP8 indexer: sparse Page-MQA plus mask-aware paged Top512.
+    SGLANG_DSV4_HCU_LIGHTOP_MASK_TOPK = EnvBool(False)
+    # gfx938 DSV4 FP8 indexer: DeepGEMM sparse Page-MQA with LightOp mask Top512.
+    SGLANG_DSV4_HCU_DEEPGEMM_MASK_TOPK = EnvBool(False)
     SGLANG_DSA_HCU_REUSE_SORTED_TOPK = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_REUSE_SORTED_TOPK"
     )
